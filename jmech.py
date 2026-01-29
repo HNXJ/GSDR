@@ -10,8 +10,6 @@ from jaxley.channels import Leak, HH, Channel
 from jaxley.synapses import IonotropicSynapse, Synapse
 from jaxley.connect import fully_connect, sparse_connect, connect
 
-import matplotlib.pyplot as plt
-
 from matplotlib.colors import ListedColormap # Import for custom colormap
 from scipy import signal # Import scipy.signal for spectrogram
 from scipy import ndimage # Import scipy.ndimage for smoothing
@@ -158,6 +156,112 @@ class GradedNMDA(Synapse):
         # we might omit explicit voltage dependence or add it as a separate factor.
         # For now, keeping it similar to other graded synapses.
         return params["gNMDA"] * states["sNMDA"] * (post_v - params["ENMDA"])
+
+
+class Inoise(Channel):
+    """
+    Stochastic Ornstein-Uhlenbeck noise channel.
+    """
+    def __init__(self, name: str = None, initial_seed: Optional[int] = None, initial_amp_noise: Optional[float] = None, initial_tau: Optional[float] = None, initial_mean: Optional[float] = None):
+        self.current_is_in_mA_per_cm2 = True
+        super().__init__(name)
+
+        self.channel_params = {
+            "amp_noise": 0.01,  # Reduced initial noise amplitude
+            "mean": 0.00,        # The baseline current drive [mA/cm^2]
+            "tau": 20.0         # Correlation time constant [ms]
+        }
+        # If no initial_seed is provided, generate a random one using numpy.
+        # This ensures each Inoise instance gets a unique starting seed.
+        if initial_seed is None:
+            self.channel_params["seed"] = float(np.random.randint(0, 2**16 - 1))
+        else:
+            self.channel_params["seed"] = float(initial_seed)
+
+        if initial_amp_noise is None:
+            self.channel_params["amp_noise"] = float(0.01) # Ensure this default is also reduced
+        else:
+            self.channel_params["amp_noise"] = float(initial_amp_noise)
+
+        if initial_tau is None:
+            self.channel_params["tau"] = float(20.0)
+        else:
+            self.channel_params["tau"] = float(initial_tau)
+
+        if initial_mean is None:
+            self.channel_params["mean"] = float(0.00)
+        else:
+            self.channel_params["mean"] = float(initial_mean)
+
+        self.channel_states = {"n": 0.00, "step": 0.0}
+        self.current_name = "i_noise"
+
+    def update_states(self, states, dt, v, params):
+        """
+        Updates the noise state 'n' using an Ornstein-Uhlenbeck process.
+        """
+        n = states["n"]
+        step = states["step"]
+
+        # 1. RNG Handling
+        # When JAXley vmaps the update_states function, params["seed"] will be an array.
+        # All other inputs (n, step, v, dt) will also be batched (arrays).
+        # We need to vmap the PRNGKey and fold_in calls.
+
+        # Ensure seed is an integer type for PRNGKey
+        seeds_int = params["seed"].astype(int)
+
+        # Create base keys (potentially batched)
+        if seeds_int.ndim == 0:
+            base_key = jax.random.PRNGKey(seeds_int)
+        else:
+            base_key = jax.vmap(jax.random.PRNGKey)(seeds_int)
+
+        # Fold in step (potentially batched)
+        if step.ndim == 0:
+            step_key = jax.random.fold_in(base_key, step.astype(int))
+        else: # if step is an array
+            step_key = jax.vmap(jax.random.fold_in)(base_key, step.astype(int))
+
+        # Generate normal random numbers (potentially batched)
+        # A single JAX PRNGKey has shape (2,) and ndim=1.
+        # An array of N JAX PRNGKeys has shape (N, 2) and ndim=2.
+        if step_key.ndim == 1: # if step_key is a single key
+            xi = jax.random.normal(step_key)
+        else: # if step_key is an array of keys (ndim 2 for key array)
+            xi = jax.vmap(jax.random.normal)(step_key)
+
+        # 2. Physics (Ornstein-Uhlenbeck)
+        # dn = -(n - mean)/tau * dt + sigma*sqrt(2/tau)*dW
+        mu = params["mean"]
+        sigma = params["amp_noise"]
+        tau = params["tau"]
+
+        drift = (mu - n) / tau * dt
+        diffusion = sigma * jnp.sqrt(2.0 / tau) * xi * jnp.sqrt(dt_global) # FIX: Changed dt to dt_global
+
+        new_n = n + drift + diffusion # FIX: Changed 'n' to 'n_prev'
+
+        # Return new state AND increment step
+        return {"n": new_n, "step": step + 1.0}
+
+    def compute_current(self, states, v, params):
+        """
+        Returns the current.
+        Note: We return negative 'n' so that a positive mean acts
+        as an excitatory (depolarizing) injection in the cable equation.
+        """
+        return -states["n"]
+
+    def init_state(self, states, v, params, delta_t):
+        """
+        Initialize to the mean value.
+        This needs to handle batched parameters if JAXley vmaps init_state.
+        """
+        # If params["mean"] is a scalar, jnp.zeros_like(params["mean"]) is a scalar 0.0.
+        # If params["mean"] is an array, jnp.zeros_like(params["mean"]) is an array of 0.0s.
+        # This handles both cases correctly.
+        return {"n": jnp.zeros_like(params["mean"]) + params["mean"], "step": jnp.zeros_like(params["mean"]) + 0.0}
 
 
 class GradedDRD1(Synapse):
@@ -388,7 +492,7 @@ class GradedCustomMechanism(Synapse):
 
     def update_states(self, states, dt, pre_v, post_v, params):
         s = states["sCustom"]
-        activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thCustom"]) / params["slopeCustom"])) 
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thCustom"]) / params["slopeCustom"]))
         d_s = (-s / params["tauDCustom"]) + activation * ((1 - s) / params["tauRCustom"])
         return {"sCustom": s + d_s * dt}
 
