@@ -1,3 +1,32 @@
+import jax.numpy as jnp
+import jaxley as jx
+import numpy as np
+import jaxley.optimize.transforms as jt
+import jax
+import jax.scipy.signal
+
+from jax import jit, vmap, value_and_grad
+from jaxley.channels import Leak, HH, Channel
+from jaxley.synapses import IonotropicSynapse, Synapse
+from jaxley.connect import fully_connect, sparse_connect, connect
+
+import matplotlib.pyplot as plt
+
+from matplotlib.colors import ListedColormap # Import for custom colormap
+from scipy import signal # Import scipy.signal for spectrogram
+from scipy import ndimage # Import scipy.ndimage for smoothing
+
+import optax
+from flax.struct import dataclass # For GSDR
+from typing import Any, Callable, NamedTuple, Optional, Tuple # Added Tuple
+from scipy.ndimage import zoom, gaussian_filter
+
+from scipy import signal
+import matplotlib.pyplot as plt
+import jax.numpy as jnp
+import numpy as np
+
+
 class GradedAMPA(Synapse):
     """
     Graded Excitatory Synapse (AMPA).
