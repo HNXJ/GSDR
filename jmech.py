@@ -1,28 +1,12 @@
 import jax.numpy as jnp
 import jaxley as jx
 import numpy as np
-import jaxley.optimize.transforms as jt
 import jax
-import jax.scipy.signal
 
-from jax import jit, vmap, value_and_grad
-from jaxley.channels import Leak, HH, Channel
-from jaxley.synapses import IonotropicSynapse, Synapse
-from jaxley.connect import fully_connect, sparse_connect, connect
-
-from matplotlib.colors import ListedColormap # Import for custom colormap
-from scipy import signal # Import scipy.signal for spectrogram
-from scipy import ndimage # Import scipy.ndimage for smoothing
-
-import optax
-from flax.struct import dataclass # For GSDR
-from typing import Any, Callable, NamedTuple, Optional, Tuple # Added Tuple
-from scipy.ndimage import zoom, gaussian_filter
-
-from scipy import signal
-import matplotlib.pyplot as plt
-import jax.numpy as jnp
-import numpy as np
+from jax import vmap
+from jaxley.channels import Channel
+from jaxley.synapses import Synapse
+from typing import Optional, Tuple
 
 
 class GradedAMPA(Synapse):
@@ -238,7 +222,7 @@ class Inoise(Channel):
         tau = params["tau"]
 
         drift = (mu - n) / tau * dt
-        diffusion = sigma * jnp.sqrt(2.0 / tau) * xi * jnp.sqrt(dt_global) # FIX: Changed dt to dt_global
+        diffusion = sigma * jnp.sqrt(2.0 / tau) * xi * jnp.sqrt(dt) # FIX: Changed dt_global to dt
 
         new_n = n + drift + diffusion # FIX: Changed 'n' to 'n_prev'
 
@@ -466,7 +450,7 @@ class GradednACH(Synapse):
 
     def update_states(self, states, dt, pre_v, post_v, params):
         s = states["snACH"]
-        activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thnACH"]) / params["slopenACH"])) # Sigmoidal activation
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["slopenACH"]) / params["slopenACH"])) # Sigmoidal activation
         d_s = (-s / params["tauDnACH"]) + activation * ((1 - s) / params["tauRnACH"])
         return {"snACH": s + d_s * dt}
 
