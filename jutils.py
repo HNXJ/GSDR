@@ -1,30 +1,15 @@
 import jax.numpy as jnp
 import jaxley as jx
 import numpy as np
-import jaxley.optimize.transforms as jt
 import jax
+
 import jax.scipy.signal
+import matplotlib.pyplot as plt
 
 from jax import jit, vmap, value_and_grad
-from jaxley.channels import Leak, HH, Channel
-from jaxley.synapses import IonotropicSynapse, Synapse
-from jaxley.connect import fully_connect, sparse_connect, connect
-
-import matplotlib.pyplot as plt
-
-from matplotlib.colors import ListedColormap # Import for custom colormap
-from scipy import signal # Import scipy.signal for spectrogram
-from scipy import ndimage # Import scipy.ndimage for smoothing
-
-import optax
-from flax.struct import dataclass # For GSDR
-from typing import Any, Callable, NamedTuple, Optional, Tuple # Added Tuple
-from scipy.ndimage import zoom, gaussian_filter
-
-from scipy import signal
-import matplotlib.pyplot as plt
-import jax.numpy as jnp
-import numpy as np
+from scipy import signal # For signal.spectrogram
+from scipy.ndimage import zoom, gaussian_filter # For spectrogram smoothing and upsampling
+from typing import Optional, Tuple
 
 
 def extend_traces_for_spectrogram(traces, nperseg):
@@ -89,12 +74,12 @@ def vis_smoothed_spectrogram(ax, data, t_range, f_range, zoom_fac=3, sigma=1.5):
     ax.imshow(data_smooth, aspect='auto', origin='lower', cmap='jet', extent=extent, interpolation='bicubic')
 
 
-def test_net_vis_comp_psd(net, params, input_scalar, label_psd, label_psd_2, interval1=(1, 500), interval2=(501, 1000), savename=None):
+def test_net_vis_comp_psd(net, params, simulate_fn, input_scalar, label_psd, label_psd_2, global_psd_interval, dt_global, lower_c, upper_c, psd_weight, firing_rate_weight, interval1=(1, 500), interval2=(501, 1000), savename=None):
     """
     Visualizes the PSD prediction and loss for a single input/label pair over two specific intervals.
     """
     # 1. Simulate (Scalar input)
-    traces = simulate(params, input_scalar) # Shape (Cells, Time)
+    traces = simulate_fn(params, input_scalar) # Shape (Cells, Time)
 
     # Helper to calculate PSD and stats for a specific interval
     def analyze_interval(traces_segment, dt):
@@ -136,8 +121,8 @@ def test_net_vis_comp_psd(net, params, input_scalar, label_psd, label_psd_2, int
 
     # Calculate Loss for Interval 1
     epsilon = 1e-6
-    psd_loss1 = jnp.sum(jnp.square(label_psd * jnp.log((psd1 + epsilon) / (labels + epsilon))))
-    psd_loss2 = jnp.sum(jnp.square(label_psd_2 * jnp.log((psd2 + epsilon) / (labels + epsilon))))
+    psd_loss1 = jnp.sum(jnp.square(label_psd * jnp.log((psd1 + epsilon) / (label_psd + epsilon))))
+    psd_loss2 = jnp.sum(jnp.square(label_psd_2 * jnp.log((psd2 + epsilon) / (label_psd_2 + epsilon))))
 
     # Firing rate penalty approximation for single scalar mean FR (assuming uniform distribution roughly)
     # Note: This differs slightly from calculating per neuron then averaging penalty, but fits the "mean_fr" scalar we have
@@ -198,12 +183,12 @@ def test_net_vis_comp_psd(net, params, input_scalar, label_psd, label_psd_2, int
 
     return total_loss1
 
-def test_net_vis_comp_tfr(net, params, input_scalar, label_psd=None, interval1=(1, 500), interval2=(501, 1000), savename=None):
+def test_net_vis_comp_tfr(net, params, simulate_fn, input_scalar, dt_global, label_psd=None, interval1=(1, 500), interval2=(501, 1000), savename=None):
     """
     Visualizes the model raster and spectrogram.
     """
     # 1. Simulate
-    traces = simulate(params, input_scalar)
+    traces = simulate_fn(params, input_scalar)
 
     # 2. Raster
     spike_threshold = -20.0
@@ -317,7 +302,7 @@ def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 10
     spike_threshold = -20.0
     num_neurons = traces.shape[0]
 
-    downsampling_factor = int(jnp.ceil(1.0 / dt_global))
+    downsampling_factor = int(jnp.ceil(1.0 / dt_trace))
     if downsampling_factor <= 0:
         downsampling_factor = 1
 
@@ -350,7 +335,7 @@ def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 10
     cumulative_spiking = jnp.sum(spike_image, axis=0)
 
     # 3. Spectrogram (Summed across neurons)
-    fs = 1000.0 / dt_global
+    fs = 1000.0 / dt_trace
     nperseg = int(200.0 * fs / 1000.0) # 200ms window
     noverlap = int(nperseg * 0.99)
 
@@ -379,7 +364,7 @@ def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 10
     axs.append(fig.add_subplot(gs[2], sharex=axs[0]))
 
     # Raster
-    t_max = traces.shape[1] * dt_global
+    t_max = traces.shape[1] * dt_trace
     axs[0].imshow(spike_image, aspect='auto', cmap='Greys', origin='lower', interpolation='none',
                   extent=[0, t_max, 0, spike_image.shape[0]])
     axs[0].set_title("Model Raster")
@@ -417,7 +402,7 @@ def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 10
     plt.show()
 
 
-def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_params, log_net):
+def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_params, log_net, Ne, Nig, Nil):
     """
     Saves various components of the JAXley model to a single .pkl file using pickle.
     Args:
@@ -428,6 +413,7 @@ def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_p
         mid_params: Intermediate parameters (if any).
         final_params: Final trained parameters of the network.
         log_net: Training log data.
+        Ne, Nig, Nil: Network size parameters.
     """
     full_path = os.path.join(filepath, filename + ".pkl") # Changed extension to .pkl
 
@@ -448,12 +434,13 @@ def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_p
     print(f"Model components saved to {full_path}")
 
 
-def load_jnn(filename, filepath):
+def load_jnn(filename, filepath, net_eig_fn):
     """
     Loads various components of the JAXley model from a .pkl file using pickle.
     Args:
         filename (str): Base name for the file (e.g., "model_001").
         filepath (str): Directory path to load the file from.
+        net_eig_fn: The function to reconstruct the network.
     Returns:
         tuple: (rebuilt_net_object, initial_params, mid_params, final_params, log_net)
               where rebuilt_net_object is recreated and its parameters set.
@@ -468,116 +455,9 @@ def load_jnn(filename, filepath):
     log_net = loaded_data['log_net']
     net_params = loaded_data['net_params']
 
-    rebuilt_net = net_eig(loaded_data['Ne'], loaded_data['Nig'], loaded_data['Nil'])
+    rebuilt_net = net_eig_fn(loaded_data['Ne'], loaded_data['Nig'], loaded_data['Nil'])
     print(f"Model components loaded from {full_path}")
     return rebuilt_net, initial_params, mid_params, final_params, log_net
-
-
-class Inoise(Channel):
-    """
-    Stochastic Ornstein-Uhlenbeck noise channel.
-    """
-    def __init__(self, name: str = None, initial_seed: Optional[int] = None, initial_amp_noise: Optional[float] = None, initial_tau: Optional[float] = None, initial_mean: Optional[float] = None):
-        self.current_is_in_mA_per_cm2 = True
-        super().__init__(name)
-
-        self.channel_params = {
-            "amp_noise": 0.01,  # Reduced initial noise amplitude
-            "mean": 0.00,        # The baseline current drive [mA/cm^2]
-            "tau": 20.0         # Correlation time constant [ms]
-        }
-        # If no initial_seed is provided, generate a random one using numpy.
-        # This ensures each Inoise instance gets a unique starting seed.
-        if initial_seed is None:
-            self.channel_params["seed"] = float(np.random.randint(0, 2**16 - 1))
-        else:
-            self.channel_params["seed"] = float(initial_seed)
-
-        if initial_amp_noise is None:
-            self.channel_params["amp_noise"] = float(0.01) # Ensure this default is also reduced
-        else:
-            self.channel_params["amp_noise"] = float(initial_amp_noise)
-
-        if initial_tau is None:
-            self.channel_params["tau"] = float(20.0)
-        else:
-            self.channel_params["tau"] = float(initial_tau)
-
-        if initial_mean is None:
-            self.channel_params["mean"] = float(0.00)
-        else:
-            self.channel_params["mean"] = float(initial_mean)
-
-        self.channel_states = {"n": 0.00, "step": 0.0}
-        self.current_name = "i_noise"
-
-    def update_states(self, states, dt, v, params):
-        """
-        Updates the noise state 'n' using an Ornstein-Uhlenbeck process.
-        """
-        n = states["n"]
-        step = states["step"]
-
-        # 1. RNG Handling
-        # When JAXley vmaps the update_states function, params["seed"] will be an array.
-        # All other inputs (n, step, v, dt) will also be batched (arrays).
-        # We need to vmap the PRNGKey and fold_in calls.
-
-        # Ensure seed is an integer type for PRNGKey
-        seeds_int = params["seed"].astype(int)
-
-        # Create base keys (potentially batched)
-        if seeds_int.ndim == 0:
-            base_key = jax.random.PRNGKey(seeds_int)
-        else:
-            base_key = jax.vmap(jax.random.PRNGKey)(seeds_int)
-
-        # Fold in step (potentially batched)
-        if step.ndim == 0:
-            step_key = jax.random.fold_in(base_key, step.astype(int))
-        else: # if step is an array
-            step_key = jax.vmap(jax.random.fold_in)(base_key, step.astype(int))
-
-        # Generate normal random numbers (potentially batched)
-        # A single JAX PRNGKey has shape (2,) and ndim=1.
-        # An array of N JAX PRNGKeys has shape (N, 2) and ndim=2.
-        if step_key.ndim == 1: # if step_key is a single key
-            xi = jax.random.normal(step_key)
-        else: # if step_key is an array of keys (ndim 2 for key array)
-            xi = jax.vmap(jax.random.normal)(step_key)
-
-        # 2. Physics (Ornstein-Uhlenbeck)
-        # dn = -(n - mean)/tau * dt + sigma*sqrt(2/tau)*dW
-        mu = params["mean"]
-        sigma = params["amp_noise"]
-        tau = params["tau"]
-
-        drift = (mu - n) / tau * dt
-        diffusion = sigma * jnp.sqrt(2.0 / tau) * xi * jnp.sqrt(dt_global) # FIX: Changed dt to dt_global
-
-        new_n = n + drift + diffusion # FIX: Changed 'n' to 'n_prev'
-
-        # Return new state AND increment step
-        return {"n": new_n, "step": step + 1.0}
-
-    def compute_current(self, states, v, params):
-        """
-        Returns the current.
-        Note: We return negative 'n' so that a positive mean acts
-        as an excitatory (depolarizing) injection in the cable equation.
-        """
-        return -states["n"]
-
-    def init_state(self, states, v, params, delta_t):
-        """
-        Initialize to the mean value.
-        This needs to handle batched parameters if JAXley vmaps init_state.
-        """
-        # If params["mean"] is a scalar, jnp.zeros_like(params["mean"]) is a scalar 0.0.
-        # If params["mean"] is an array, jnp.zeros_like(params["mean"]) is an array of 0.0s.
-        # This handles both cases correctly.
-        return {"n": jnp.zeros_like(params["mean"]) + params["mean"], "step": jnp.zeros_like(params["mean"]) + 0.0}
-
 
 
 def noise_current(
@@ -620,7 +500,7 @@ def noise_current(
         xi = jax.random.normal(key_noise)
 
         drift = (noise_mean - n_prev) / noise_correlation_tau * delta_t
-        diffusion = noise_standard_deviation * jnp.sqrt(2.0 / noise_correlation_tau) * xi * jnp.sqrt(dt_global) # FIX: Changed dt to dt_global
+        diffusion = noise_standard_deviation * jnp.sqrt(2.0 / noise_correlation_tau) * xi * jnp.sqrt(delta_t) # FIX: Changed dt to delta_t
 
         new_n = n_prev + drift + diffusion # FIX: Changed 'n' to 'n_prev'
 
@@ -1076,4 +956,4 @@ def plot_full_simulation_summary(recorded_voltages, time_axis, dt_global,
         plt.savefig(savename, format='svg')
 
     plt.show()
-
+                                     
