@@ -6,6 +6,7 @@ import jax
 from jax import vmap
 from jaxley.channels import Channel
 from jaxley.synapses import Synapse
+
 from typing import Optional, Tuple
 
 
@@ -482,3 +483,4 @@ class GradedCustomMechanism(Synapse):
 
     def compute_current(self, states, pre_v, post_v, params):
         return params["gCustom"] * states["sCustom"] * (post_v - params["ECustom"])
+
