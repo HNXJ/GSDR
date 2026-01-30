@@ -2,14 +2,69 @@ import jax.numpy as jnp
 import jaxley as jx
 import numpy as np
 import jax
-
 import jax.scipy.signal
-import matplotlib.pyplot as plt
 
 from jax import jit, vmap, value_and_grad
 from scipy import signal # For signal.spectrogram
+from scipy.signal import detrend # Import detrend specifically
 from scipy.ndimage import zoom, gaussian_filter # For spectrogram smoothing and upsampling
+
+import matplotlib.pyplot as plt
+
 from typing import Optional, Tuple
+
+
+class Dataset:
+    """
+    A simple Dataloader which returns batches of the data.
+
+    Instead of using this simple dataloader, you can also just use one from
+    PyTorch or Tensorflow. You do not have to understand what is going on here
+    to follow this tutorial.
+    """
+
+    def __init__(self, inputs: np.ndarray, labels: np.ndarray):
+        """
+        Initialize the dataloader.
+
+        Args:
+            inputs: Array of shape (num_samples, num_dim)
+            labels: Array of shape (num_samples,)
+        """
+        assert len(inputs) == len(labels), "Inputs and labels must have same length"
+        self.inputs = inputs
+        self.labels = labels
+        self.num_samples = len(inputs)
+        self._rng_state = None
+        self.batch_size = 1
+
+    def shuffle(self, seed=None):
+        """
+        Shuffle the dataset in-place
+        """
+        self._rng_state = np.random.get_state()[1][0] if seed is None else seed
+        np.random.seed(self._rng_state)
+        indices = np.random.permutation(self.num_samples)
+        self.inputs = self.inputs[indices]
+        self.labels = self.labels[indices]
+        return self
+
+    def batch(self, batch_size):
+        """
+        Create batches of the data.
+        """
+        self.batch_size = batch_size
+        return self
+
+    def __iter__(self):
+        """
+        Iterate over the dataset.
+        """
+        self.shuffle(seed=self._rng_state)
+        for start in range(0, self.num_samples, self.batch_size):
+            end = min(start + self.batch_size, self.num_samples)
+            yield self.inputs[start:end], self.labels[start:end]
+        self._rng_state += 1
 
 
 def extend_traces_for_spectrogram(traces, nperseg):
@@ -26,6 +81,7 @@ def extend_traces_for_spectrogram(traces, nperseg):
     traces_extended = jnp.concatenate([prefix, traces, suffix], axis=1)
     return traces_extended
 
+
 def compute_summed_spectrogram(traces_extended, fs, nperseg, noverlap):
     """
     Calculates spectrogram on each row separately and sums them up.
@@ -39,24 +95,24 @@ def compute_summed_spectrogram(traces_extended, fs, nperseg, noverlap):
 
     for i in range(traces_np.shape[0]):
         f, t, Sxx = signal.spectrogram(traces_np[i], fs=fs, window='hann', nperseg=nperseg, noverlap=noverlap)
+        # Apply detrend before summing
+        Sxx_detrended = Sxx / Sxx[0]
+        Sxx_detrended = Sxx
         if total_Sxx is None:
-            total_Sxx = Sxx
+            total_Sxx = Sxx_detrended
             freqs = f
             times = t
         else:
-            total_Sxx += Sxx
+            total_Sxx += Sxx_detrended
 
-    temp_n = total_Sxx.shape[1]
-    temp_w = int(temp_n/20)
-    temp_d = int(temp_w/20)
-    density_Sxx = np.zeros(total_Sxx.shape)
+    # Normalize each time slice (column) by its total power, as requested
+    # Add a small epsilon to avoid division by zero
+    total_power_at_each_time = np.sum(total_Sxx, axis=0, keepdims=True)
+    # Ensure total_power_at_each_time is not zero to prevent division by zero
+    total_power_at_each_time = np.where(total_power_at_each_time == 0, 1e-9, total_power_at_each_time)
+    normalized_Sxx = total_Sxx / total_power_at_each_time
 
-    for i in range(0, temp_n, max(1, temp_d)):
-        temp_l = i
-        temp_r = np.min([i + temp_w, temp_n])
-        density_Sxx[:, temp_l:temp_r] = total_Sxx[:, temp_l:temp_r] / np.max(total_Sxx[:, temp_l:temp_r])
-
-    return freqs, times, density_Sxx
+    return freqs, times, normalized_Sxx
 
 
 def vis_smoothed_spectrogram(ax, data, t_range, f_range, zoom_fac=3, sigma=1.5):
@@ -294,12 +350,11 @@ def test_net_vis_comp_tfr(net, params, simulate_fn, input_scalar, dt_global, lab
     plt.show()
 
 
-def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 1000), dt_trace=0.1):
+def trace_vis_tfr(traces, label_psd=None, interval1=(1, 500), interval2=(501, 1000), dt_trace=0.1, savename: Optional[str] = None, spike_threshold=-20.0):
     """
     Visualizes the model raster and spectrogram.
     """
     # 2. Raster
-    spike_threshold = -20.0
     num_neurons = traces.shape[0]
 
     downsampling_factor = int(jnp.ceil(1.0 / dt_trace))
@@ -415,7 +470,7 @@ def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_p
         log_net: Training log data.
         Ne, Nig, Nil: Network size parameters.
     """
-    full_path = os.path.join(filepath, filename + ".pkl") # Changed extension to .pkl
+    full_path = os.opath.join(filepath, filename + ".pkl") # Changed extension to .pkl
 
     # Collect all data into a dictionary
     model_data = {
@@ -658,7 +713,6 @@ def noise_current_ac(
 
         # Euler-Maruyama method
         drift = (noise_mean - n_prev) / noise_correlation_tau * delta_t
-        # Fixed: replaced 'dt_global' with passed 'delta_t'
         diffusion = noise_standard_deviation * jnp.sqrt(2.0 / noise_correlation_tau) * xi * jnp.sqrt(delta_t)
 
         new_n = n_prev + drift + diffusion
@@ -956,4 +1010,5 @@ def plot_full_simulation_summary(recorded_voltages, time_axis, dt_global,
         plt.savefig(savename, format='svg')
 
     plt.show()
+
                                      
