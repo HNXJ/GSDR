@@ -5,10 +5,64 @@ import jax
 
 import jax.scipy.signal
 import jax.numpy as jnp
+import jax.tree_util # Added import
 
 from typing import NamedTuple, Optional, Any
 from flax.struct import dataclass
 from typing import Any, Callable, NamedTuple, Optional, Tuple
+
+
+class Dataset:
+    """
+    A simple Dataloader which returns batches of the data.
+
+    Instead of using this simple dataloader, you can also just use one from
+    PyTorch or Tensorflow. You do not have to understand what is going on here
+    to follow this tutorial.
+    """
+
+    def __init__(self, inputs: np.ndarray, labels: np.ndarray):
+        """
+        Initialize the dataloader.
+
+        Args:
+            inputs: Array of shape (num_samples, num_dim)
+            labels: Array of shape (num_samples,)
+        """
+        assert len(inputs) == len(labels), "Inputs and labels must have same length"
+        self.inputs = inputs
+        self.labels = labels
+        self.num_samples = len(inputs)
+        self._rng_state = None
+        self.batch_size = 1
+
+    def shuffle(self, seed=None):
+        """
+        Shuffle the dataset in-place
+        """
+        self._rng_state = np.random.get_state()[1][0] if seed is None else seed
+        np.random.seed(self._rng_state)
+        indices = np.random.permutation(self.num_samples)
+        self.inputs = self.inputs[indices]
+        self.labels = self.labels[indices]
+        return self
+
+    def batch(self, batch_size):
+        """
+        Create batches of the data.
+        """
+        self.batch_size = batch_size
+        return self
+
+    def __iter__(self):
+        """
+        Iterate over the dataset.
+        """
+        self.shuffle(seed=self._rng_state)
+        for start in range(0, self.num_samples, self.batch_size):
+            end = min(start + self.batch_size, self.num_samples)
+            yield self.inputs[start:end], self.labels[start:end]
+        self._rng_state += 1
 
 
 class ClampTransform(jt.Transform):
@@ -149,8 +203,8 @@ def GSDR(
             params_opt=params,
             inner_state_opt=inner_state,
             loss_opt=jnp.inf,
-            alpha=0.5, # Initialized to 0.5, will be dynamically calculated
-            a_opt=0.5, # Initialized to 0.5
+            alpha=0.5,
+            a_opt=0.5,
             lambda_d=lambda_d,
             step_count=0,
             consecutive_unchanged_epochs=0,
@@ -285,7 +339,7 @@ def GSDR(
 
             delta_for_combined = jax.tree.map(lambda x: boundTransform.forward(x), delta_for_combined)
 
-            delta_flat = jax.tree.util.tree_leaves(delta_for_combined)
+            delta_flat = jax.tree_util.tree_leaves(delta_for_combined) # Fixed access
             avg_delta = jnp.mean(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
             std_delta = jnp.std(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
             jax.debug.print("GSDR: Avg Delta (Noise): {}, Std Delta (Noise): {}", avg_delta, std_delta)
@@ -296,7 +350,7 @@ def GSDR(
                 delta_for_combined, transformed_inner_updates # Use transformed inner updates
             )
 
-            combined_updates_flat = jax.tree.util.tree_leaves(combined_updates)
+            combined_updates_flat = jax.tree_util.tree_leaves(combined_updates) # Fixed access
             avg_combined_update = jnp.mean(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
             std_combined_update = jnp.std(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
             jax.debug.print("GSDR: Avg Combined Update: {}, Std Combined Update: {}", avg_combined_update, std_combined_update)
