@@ -12,59 +12,6 @@ from flax.struct import dataclass
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 
-class Dataset:
-    """
-    A simple Dataloader which returns batches of the data.
-
-    Instead of using this simple dataloader, you can also just use one from
-    PyTorch or Tensorflow. You do not have to understand what is going on here
-    to follow this tutorial.
-    """
-
-    def __init__(self, inputs: np.ndarray, labels: np.ndarray):
-        """
-        Initialize the dataloader.
-
-        Args:
-            inputs: Array of shape (num_samples, num_dim)
-            labels: Array of shape (num_samples,)
-        """
-        assert len(inputs) == len(labels), "Inputs and labels must have same length"
-        self.inputs = inputs
-        self.labels = labels
-        self.num_samples = len(inputs)
-        self._rng_state = None
-        self.batch_size = 1
-
-    def shuffle(self, seed=None):
-        """
-        Shuffle the dataset in-place
-        """
-        self._rng_state = np.random.get_state()[1][0] if seed is None else seed
-        np.random.seed(self._rng_state)
-        indices = np.random.permutation(self.num_samples)
-        self.inputs = self.inputs[indices]
-        self.labels = self.labels[indices]
-        return self
-
-    def batch(self, batch_size):
-        """
-        Create batches of the data.
-        """
-        self.batch_size = batch_size
-        return self
-
-    def __iter__(self):
-        """
-        Iterate over the dataset.
-        """
-        self.shuffle(seed=self._rng_state)
-        for start in range(0, self.num_samples, self.batch_size):
-            end = min(start + self.batch_size, self.num_samples)
-            yield self.inputs[start:end], self.labels[start:end]
-        self._rng_state += 1
-
-
 class ClampTransform(jt.Transform):
     def __init__(self, lower_bound, upper_bound):
         self.lower_bound = lower_bound
@@ -189,11 +136,13 @@ def GSDR(
     deselection_threshold: float = 2.0,
     lambda_d: float = 1.0,
     checkpoint_n: int = 10,
+    alpha_init: float = 0.1,
+    alpha_dynamic: bool = True,
     tau_a_growth: float = 10.0,
     mcdp: bool = True
 ) -> optax.GradientTransformation:
     """
-    Optax-compliant implementation of the Genetic-Stochastic Delta Rule.
+    Optax- Genetic-Stochastic Delta Rule.
     """
 
     def init_fn(params):
@@ -286,6 +235,215 @@ def GSDR(
             time_since_last_change = jnp.maximum(0, _current_step - step_of_last_optimal_change)
             effective_lambda_d = (time_since_last_change**2) * (1.0 - jnp.exp(-(time_since_last_change) / tau_a_growth))
 
+            inner_opt_key, delta_dist_key, noise_key_for_variance = jax.random.split(key, 3)
+            inner_updates_raw, updated_inner_state = inner_optimizer.update(grads, state.inner_state, _params, value=loss, key=inner_opt_key)
+            boundTransform = ClampTransform(-1.0, 1.0)
+            transformed_inner_updates = jax.tree.map(lambda x: boundTransform.forward(x), inner_updates_raw)
+
+            param_leaves_for_variance, treedef_for_variance = jax.tree.flatten(_params)
+            subkeys_for_delta_variance = jax.random.split(noise_key_for_variance, len(param_leaves_for_variance))
+            param_keys_tree_for_delta_variance = jax.tree.unflatten(treedef_for_variance, subkeys_for_delta_variance)
+
+            delta_d_for_variance = jax.tree.map(
+                lambda p, k: delta_distribution(k, p.shape),
+                _params, param_keys_tree_for_delta_variance
+            )
+            transformed_delta_for_variance = jax.tree.map(lambda x: boundTransform.forward(x), delta_d_for_variance)
+
+            flat_inner_updates, _ = jax.flatten_util.ravel_pytree(transformed_inner_updates)
+            flat_delta, _ = jax.flatten_util.ravel_pytree(transformed_delta_for_variance)
+
+            var_inner_updates = jnp.var(flat_inner_updates)
+            var_delta = jnp.var(flat_delta)
+
+            if alpha_dynamic:
+                sum_var = var_inner_updates + var_delta
+                next_a = jnp.where(sum_var > 1e-9, var_inner_updates / sum_var, 0.5)
+                growth_factor = next_consecutive_unchanged_epochs / checkpoint_n
+                next_a = next_a * growth_factor
+            else:
+                next_a = alpha_init
+
+            next_a = jnp.clip(next_a, 0.0, 1.0)
+
+            param_leaves_for_update, treedef_for_update = jax.tree.flatten(_params)
+            subkeys_for_delta = jax.random.split(delta_dist_key, len(param_leaves_for_update))
+            param_keys_tree_for_delta_update = jax.tree.unflatten(treedef_for_update, subkeys_for_delta)
+
+            delta_d_for_combined = jax.tree.map(
+                lambda p, k: delta_distribution(k, p.shape),
+                _params, param_keys_tree_for_delta_update
+            )
+
+            if mcdp and mcdp_factors is not None:
+                delta_for_combined = jax.tree.map(lambda n, p, r: n * p * r, delta_d_for_combined, _params, mcdp_factors)
+            else:
+                delta_for_combined = jax.tree.map(lambda n, p: n * p, delta_d_for_combined, _params)
+
+            delta_for_combined = jax.tree.map(lambda x: boundTransform.forward(x), delta_for_combined)
+
+            delta_flat = jax.tree_util.tree_leaves(delta_for_combined) # Fixed access
+            avg_delta = jnp.mean(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
+            std_delta = jnp.std(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
+            jax.debug.print("GSDR: Avg Delta Dist.: {}, Std Delta (Noise): {}", avg_delta, std_delta)
+
+
+            combined_updates = jax.tree.map(
+                lambda d, g: effective_lambda_d * (next_a * d + (1 - next_a) * g),
+                delta_for_combined, transformed_inner_updates # Use transformed inner updates
+            )
+
+            combined_updates_flat = jax.tree_util.tree_leaves(combined_updates) # Fixed access
+            avg_combined_update = jnp.mean(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
+            std_combined_update = jnp.std(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
+            jax.debug.print("GSDR: Avg Combined Update: {}, Std Combined Update: {}", avg_combined_update, std_combined_update)
+
+            new_normal_state = GSDRState(
+                inner_state=updated_inner_state,
+                params_opt=_new_params_opt,
+                inner_state_opt=_new_inner_state_opt,
+                loss_opt=new_loss_opt,
+                alpha=next_a,
+                a_opt=new_a_opt,
+                lambda_d=state.lambda_d,
+                step_count=_current_step,
+                consecutive_unchanged_epochs=next_consecutive_unchanged_epochs,
+                last_optimal_change_step=step_of_last_optimal_change
+            )
+
+            return combined_updates, new_normal_state
+
+        current_step = state.step_count + 1
+        operand = (params, new_params_opt, new_inner_state_opt, current_step)
+
+        final_updates, new_state = jax.lax.cond(
+            should_reset,
+            reset_branch,
+            normal_branch,
+            operand
+        )
+
+        return final_updates, new_state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+@dataclass
+class AGSDRState:
+    inner_state: Any
+    params_opt: Any
+    inner_state_opt: Any
+    loss_opt: float
+    alpha: float
+    a_opt: float
+    lambda_d: float
+    step_count: int
+    consecutive_unchanged_epochs: int
+    last_optimal_change_step: int
+
+def AGSDR(
+    inner_optimizer: optax.GradientTransformation,
+    delta_distribution: Callable = jax.random.normal,
+    deselection_threshold: float = 2.0,
+    lambda_d: float = 1.0,
+    checkpoint_n: int = 10,
+    tau_a_growth: float = 10.0,
+    mcdp: bool = True
+) -> optax.GradientTransformation:
+    """
+    Optax- Adaptive Genetic-Stochastic Delta Rule.
+    """
+
+    def init_fn(params):
+        inner_state = inner_optimizer.init(params)
+        return AGSDRState(
+            inner_state=inner_state,
+            params_opt=params,
+            inner_state_opt=inner_state,
+            loss_opt=jnp.inf,
+            alpha=0.5,
+            a_opt=0.5,
+            lambda_d=lambda_d,
+            step_count=0,
+            consecutive_unchanged_epochs=0,
+            last_optimal_change_step=0
+        )
+
+    def update_fn(updates, state, params=None, value=None, key=None, mcdp_factors=None):
+
+        if params is None:
+            raise ValueError("AGSDR requires 'params' to be passed to update().")
+        if value is None:
+            raise ValueError("AGSDR requires current loss 'value' to be passed to update().")
+        if key is None:
+            raise ValueError("AGSDR requires a random 'key' to be passed to update().")
+
+        grads = updates
+        loss = value
+
+        # 1. Update Best-Known State (Optimality Check)
+        is_new_opt = (loss < state.loss_opt)
+
+        new_params_opt = jax.tree.map(
+            lambda cur, opt: jnp.where(is_new_opt, cur, opt),
+            params, state.params_opt
+        )
+        new_loss_opt = jnp.where(is_new_opt, loss, state.loss_opt)
+        new_a_opt = jnp.where(is_new_opt, state.alpha, state.a_opt)
+        new_inner_state_opt = jax.tree.map(
+            lambda cur, opt: jnp.where(is_new_opt, cur, opt),
+            state.inner_state, state.inner_state_opt
+        )
+
+        next_consecutive_unchanged_epochs = jnp.where(
+            is_new_opt, 0, state.consecutive_unchanged_epochs + 1
+        )
+        step_of_last_optimal_change = jnp.where(
+            is_new_opt, state.step_count + 1, state.last_optimal_change_step
+        )
+
+        # 2. Check Reset Conditions
+        is_deselect = ((loss > (new_loss_opt * deselection_threshold)) & (new_loss_opt != jnp.inf)) | (jnp.isnan(loss))
+        is_reset_due_to_checkpoint = (state.step_count > 0) & \
+                                     (next_consecutive_unchanged_epochs >= checkpoint_n) & \
+                                     (new_loss_opt != jnp.inf)
+
+        should_reset = is_deselect | is_reset_due_to_checkpoint
+
+        def reset_branch(operand):
+            _params, _new_params_opt, _new_inner_state_opt, _current_step = operand
+
+            reset_updates = jax.tree.map(
+                lambda opt_p, cur_p: opt_p - cur_p,
+                _new_params_opt, _params
+            )
+
+            reset_state = AGSDRState(
+                inner_state=_new_inner_state_opt,
+                params_opt=_new_params_opt,
+                inner_state_opt=_new_inner_state_opt,
+                loss_opt=new_loss_opt,
+                alpha=new_a_opt,
+                a_opt=new_a_opt,
+                lambda_d=state.lambda_d,
+                step_count=_current_step,
+                consecutive_unchanged_epochs=0,
+                last_optimal_change_step=_current_step
+            )
+
+            if is_reset_due_to_checkpoint:
+                jax.debug.print(">Deselection(Checkpoint)")
+            elif is_deselect:
+                jax.debug.print(">Deselection(Divergence)")
+
+            return reset_updates, reset_state
+
+        def normal_branch(operand):
+            _params, _new_params_opt, _new_inner_state_opt, _current_step = operand
+
+            time_since_last_change = jnp.maximum(0, _current_step - step_of_last_optimal_change)
+            effective_lambda_d = (time_since_last_change**2) * (1.0 - jnp.exp(-(time_since_last_change) / tau_a_growth))
+
             # Split key for inner optimizer and delta distribution, and noise (for delta_d_for_variance)
             inner_opt_key, delta_dist_key, noise_key_for_variance = jax.random.split(key, 3)
 
@@ -342,7 +500,7 @@ def GSDR(
             delta_flat = jax.tree_util.tree_leaves(delta_for_combined) # Fixed access
             avg_delta = jnp.mean(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
             std_delta = jnp.std(jnp.concatenate([x.flatten() for x in delta_flat])) if delta_flat else jnp.array(0.0)
-            jax.debug.print("GSDR: Avg Delta (Noise): {}, Std Delta (Noise): {}", avg_delta, std_delta)
+            jax.debug.print("AGSDR: Avg Delta Dist.: {}, Std Delta (Noise): {}", avg_delta, std_delta)
 
 
             combined_updates = jax.tree.map(
@@ -353,9 +511,9 @@ def GSDR(
             combined_updates_flat = jax.tree_util.tree_leaves(combined_updates) # Fixed access
             avg_combined_update = jnp.mean(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
             std_combined_update = jnp.std(jnp.concatenate([x.flatten() for x in combined_updates_flat])) if combined_updates_flat else jnp.array(0.0)
-            jax.debug.print("GSDR: Avg Combined Update: {}, Std Combined Update: {}", avg_combined_update, std_combined_update)
+            jax.debug.print("AGSDR: Avg Combined Update: {}, Std Combined Update: {}", avg_combined_update, std_combined_update)
 
-            new_normal_state = GSDRState(
+            new_normal_state = AGSDRState(
                 inner_state=updated_inner_state,
                 params_opt=_new_params_opt,
                 inner_state_opt=_new_inner_state_opt,
@@ -491,3 +649,4 @@ def adagen(
         return final_update, new_state
 
     return optax.GradientTransformation(init_fn, update_fn)
+    
