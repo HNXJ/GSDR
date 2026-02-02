@@ -1,17 +1,16 @@
 import jax.numpy as jnp
 import jaxley as jx
 import numpy as np
-
 import jax
 import jax.scipy.signal
-from jax import jit, vmap, value_and_grad
 
+from jax import jit, vmap, value_and_grad
 from scipy import signal # For signal.spectrogram
 from scipy.signal import detrend # Import detrend specifically
 from scipy.ndimage import zoom, gaussian_filter # For spectrogram smoothing and upsampling
 
 import matplotlib.pyplot as plt
-import os
+
 from typing import Optional, Tuple
 
 
@@ -471,7 +470,7 @@ def save_jnn(filename, filepath, net_object, initial_params, mid_params, final_p
         log_net: Training log data.
         Ne, Nig, Nil: Network size parameters.
     """
-    full_path = os.opath.join(filepath, filename + ".pkl") # Changed extension to .pkl
+    full_path = os.path.join(filepath, filename + ".pkl") # Changed extension to .pkl
 
     # Collect all data into a dictionary
     model_data = {
@@ -1011,5 +1010,3 @@ def plot_full_simulation_summary(recorded_voltages, time_axis, dt_global,
         plt.savefig(savename, format='svg')
 
     plt.show()
-
-                                     
