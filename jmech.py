@@ -483,4 +483,220 @@ class GradedCustomMechanism(Synapse):
 
     def compute_current(self, states, pre_v, post_v, params):
         return params["gCustom"] * states["sCustom"] * (post_v - params["ECustom"])
+        
+
+class Diffusion(Channel):
+    def __init__(self, g_max: float = 100.0, v_th: float = 50.0, slope: float = 1.0, e_rev: float = -70.0):
+        self.current_is_in_mA_per_cm2 = True # Required for Jaxley 0.5.0+
+        super().__init__()
+        self.channel_params = {
+            "Diffusion_g_max": g_max,
+            "Diffusion_v_th": v_th,
+            "Diffusion_slope": slope,
+            "Diffusion_e_rev": e_rev
+        }
+        self.channel_states = {}
+
+    def compute_current(self, states, voltage, params):
+        # Exponentially increasing conductance when V > V_th
+        # acts as a "soft" voltage clamp or diode
+        v_diff = (voltage - params["Diffusion_v_th"]) / params["Diffusion_slope"]
+        g = params["Diffusion_g_max"] * jnp.exp(v_diff)
+        # Conductance (mS/cm^2) * Voltage (mV) = Current (uA/cm^2)
+        # Divide by 1000 to get mA/cm^2
+        return (g * (voltage - params["Diffusion_e_rev"])) / 1000.0
+    
+    def init_state(self, states, voltage, params):
+        return {}
+
+
+class STDPGradedGABAa(Synapse):
+    def __init__(self, tauD_GABAa: Optional[float] = None, stdp_rate: float = 0.1):
+        super().__init__()
+        r_d_gSyn = np.random.uniform(4.0, 6.0)
+
+        self.synapse_params = {
+            "STDP_EGABAa": -80.0,
+            "STDP_tauDGABAa": 5.0,
+            "STDP_tauRGABAa": 0.5,
+            "STDP_slopeGABAa": 5.0,
+            "STDP_V_thGABAa": -20.0,
+            # STDP Parameters - Prefixed
+            "GABAa_stdp_rate": stdp_rate,
+            "GABAa_tau_p": 30.0,
+            "GABAa_c_p": 0.06,   # Scaled down from 60.0
+            "GABAa_c_d": 0.1,    # Scaled down from 100.0
+            "GABAa_V_spike": 0.0,
+        }
+
+        if tauD_GABAa is not None:
+            self.synapse_params["STDP_tauDGABAa"] = tauD_GABAa
+
+        self.synapse_states = {
+            "STDP_sGABAa": 0.1,
+            "STDP_gGABAa": r_d_gSyn,
+            # States - Prefixed
+            "GABAa_pre_trace": 0.0,
+            "GABAa_post_trace": 0.0
+        }
+
+    def update_states(self, states, dt, pre_v, post_v, params):
+        s = states["STDP_sGABAa"]
+        g = states["STDP_gGABAa"]
+        tr_pre = states["GABAa_pre_trace"]
+        tr_post = states["GABAa_post_trace"]
+
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["STDP_V_thGABAa"]) / params["STDP_slopeGABAa"]))
+        d_s = (-s / params["STDP_tauDGABAa"]) + activation * ((1 - s) / params["STDP_tauRGABAa"])
+
+        pre_spike = jnp.where(pre_v > params["GABAa_V_spike"], 1.0, 0.0)
+        post_spike = jnp.where(post_v > params["GABAa_V_spike"], 1.0, 0.0)
+
+        d_tr_pre = -tr_pre / params["GABAa_tau_p"] + pre_spike
+        d_tr_post = -tr_post / params["GABAa_tau_p"] + post_spike
+
+        dw_plus = params["GABAa_c_p"] * tr_pre * post_spike
+        dw_minus = params["GABAa_c_p"] * tr_post * pre_spike
+        ltd = params["GABAa_c_d"] * pre_spike
+
+        total_dw = (dw_plus - dw_minus - ltd) * params["GABAa_stdp_rate"] * dt
+
+        return {
+            "STDP_sGABAa": s + d_s * dt,
+            "STDP_gGABAa": jnp.clip(g + total_dw, a_min=0.0, a_max=2.0e-4), # Clip max conductance
+            "GABAa_pre_trace": tr_pre + d_tr_pre * dt,
+            "GABAa_post_trace": tr_post + d_tr_post * dt
+        }
+
+    def compute_current(self, states, pre_v, post_v, params):
+        return states["STDP_gGABAa"] * states["STDP_sGABAa"] * (post_v - params["STDP_EGABAa"])
+
+
+class STDPGradedAMPA(Synapse):
+    def __init__(self, tauD_AMPA: Optional[float] = None, stdp_rate: float = 0.1):
+        super().__init__()
+        r_d_gSyn = np.random.uniform(2.0, 3.0)
+
+        self.synapse_params = {
+            "STDP_EAMPA": 0.0,
+            "STDP_tauDAMPA": 5.0,
+            "STDP_tauRAMPA": 0.2,
+            "STDP_slopeAMPA": 5.0,
+            "STDP_V_thAMPA": -20.0,
+            # Scaled down STDP params
+            "AMPA_stdp_rate": stdp_rate,
+            "AMPA_tau_p": 30.0,
+            "AMPA_c_p": 0.06,
+            "AMPA_c_d": 0.1,
+            "AMPA_V_spike": 0.0
+        }
+
+        if tauD_AMPA is not None:
+            self.synapse_params["STDP_tauDAMPA"] = tauD_AMPA
+
+        self.synapse_states = {
+            "STDP_sAMPA": 0.1,
+            "STDP_gAMPA": r_d_gSyn,
+            "AMPA_pre_trace": 0.0,
+            "AMPA_post_trace": 0.0
+        }
+
+    def update_states(self, states, dt, pre_v, post_v, params):
+        s = states["STDP_sAMPA"]
+        g = states["STDP_gAMPA"]
+        tr_pre = states["AMPA_pre_trace"]
+        tr_post = states["AMPA_post_trace"]
+
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["STDP_V_thAMPA"]) / params["STDP_slopeAMPA"]))
+        d_s = (-s / params["STDP_tauDAMPA"]) + activation * ((1 - s) / params["STDP_tauRAMPA"])
+
+        pre_spike = jnp.where(pre_v > params["AMPA_V_spike"], 1.0, 0.0)
+        post_spike = jnp.where(post_v > params["AMPA_V_spike"], 1.0, 0.0)
+
+        d_tr_pre = -tr_pre / params["AMPA_tau_p"] + pre_spike
+        d_tr_post = -tr_post / params["AMPA_tau_p"] + post_spike
+
+        dw_plus = params["AMPA_c_p"] * tr_pre * post_spike
+        dw_minus = params["AMPA_c_p"] * tr_post * pre_spike
+        ltd_baseline = params["AMPA_c_d"] * pre_spike
+
+        total_dw = (dw_plus - dw_minus - ltd_baseline) * params["AMPA_stdp_rate"] * dt
+
+        return {
+            "STDP_sAMPA": s + d_s * dt,
+            "STDP_gAMPA": jnp.clip(g + total_dw, a_min=0.0, a_max=1.0e-4),
+            "AMPA_pre_trace": tr_pre + d_tr_pre * dt,
+            "AMPA_post_trace": tr_post + d_tr_post * dt
+        }
+
+    def compute_current(self, states, pre_v, post_v, params):
+        return states["STDP_gAMPA"] * states["STDP_sAMPA"] * (post_v - params["STDP_EAMPA"])
+
+
+class STDPGradedNMDA(Synapse):
+    def __init__(self, tauD_NMDA: Optional[float] = None, stdp_rate: float = 1.0):
+        super().__init__()
+        # Reduced g drastically to 1e-6 range
+        r_d_gSyn = np.random.uniform(0.1, 1.0)
+
+        self.synapse_params = {
+            "STDP_ENMDA": 0.0,
+            "STDP_tauDNMDA": 75.0,
+            "STDP_tauRNMDA": 7.0,
+            "STDP_slopeNMDA": 5.0,
+            "STDP_V_thNMDA": -20.0,
+            "NMDA_Mg2": 1.0,
+            "NMDA_stdp_rate": stdp_rate,
+            "NMDA_tau_p": 30.0,
+            "NMDA_c_p": 0.06,
+            "NMDA_c_d": 0.1,
+            "NMDA_Th": 2.5,
+            "NMDA_V_spike": 0.0
+        }
+
+        if tauD_NMDA is not None:
+            self.synapse_params["STDP_tauDNMDA"] = tauD_NMDA
+
+        self.synapse_states = {
+            "STDP_sNMDA": 0.1,
+            "STDP_gNMDA": r_d_gSyn,
+            "NMDA_pre_trace": 0.0,
+            "NMDA_post_trace": 0.0
+        }
+
+    def update_states(self, states, dt, pre_v, post_v, params):
+        s = states["STDP_sNMDA"]
+        g = states["STDP_gNMDA"]
+        tr_pre = states["NMDA_pre_trace"]
+        tr_post = states["NMDA_post_trace"]
+
+        activation = 0.5 * (1 + jnp.tanh((pre_v - params["STDP_V_thNMDA"]) / params["STDP_slopeNMDA"]))
+        d_s = (-s / params["STDP_tauDNMDA"]) + activation * ((1 - s) / params["STDP_tauRNMDA"])
+
+        pre_event = jnp.where(pre_v > params["NMDA_V_spike"], 1.0, 0.0)
+        post_event = jnp.where(post_v > params["NMDA_V_spike"], 1.0, 0.0)
+
+        d_tr_pre = -tr_pre / params["NMDA_tau_p"] + pre_event
+        d_tr_post = -tr_post / params["NMDA_tau_p"] + post_event
+
+        i_nmda = jnp.abs(self.compute_current(states, pre_v, post_v, params))
+        ca_gate = jnp.maximum(i_nmda - params["NMDA_Th"], 0.0)
+
+        dw_plus = params["NMDA_c_p"] * ca_gate * tr_pre * post_event
+        dw_minus = params["NMDA_c_p"] * ca_gate * tr_post * pre_event
+        ltd = params["NMDA_c_d"] * pre_event
+
+        total_dw = (dw_plus - dw_minus - ltd) * params["NMDA_stdp_rate"] * dt
+
+        return {
+            "STDP_sNMDA": s + d_s * dt,
+            "STDP_gNMDA": jnp.clip(g + total_dw, a_min=0.0, a_max=1.0e-4),
+            "NMDA_pre_trace": tr_pre + d_tr_pre * dt,
+            "NMDA_post_trace": tr_post + d_tr_post * dt
+        }
+
+    def compute_current(self, states, pre_v, post_v, params):
+        mg_block = 1.0 / (1.0 + params["NMDA_Mg2"] * jnp.exp(-0.062 * post_v / 3.57))
+        return states["STDP_gNMDA"] * states["STDP_sNMDA"] * mg_block * (post_v - params["STDP_ENMDA"])
+
 
