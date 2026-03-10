@@ -40,7 +40,9 @@ class Inoise(jx.channels.Channel):
         mu, sigma, tau = params["mean"], params["amp_noise"], params["tau"]
         drift = (mu - n) / tau * dt
         diffusion = sigma * jnp.sqrt(2.0 / tau) * xi * jnp.sqrt(dt)
-        return {"n": n + drift + diffusion, "step": step + 1.0}
+        new_n = n + drift + diffusion
+        new_n = jnp.where(jnp.isnan(new_n) | jnp.isinf(new_n), n, new_n)
+        return {"n": new_n, "step": step + 1.0}
 
     def compute_current(self, states, v, params): return -states["n"]
     def init_state(self, states, v, params, delta_t): return {"n": params["mean"], "step": 0.0}
@@ -55,7 +57,10 @@ class GradedAMPA(jx.synapses.Synapse):
         s = states["sAMPA"]
         activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thAMPA"]) / params["slopeAMPA"]))
         d_s = (-s / params["tauDAMPA"]) + activation * ((1 - s) / params["tauRAMPA"])
-        return {"sAMPA": s + d_s * dt}
+        new_s = s + d_s * dt
+        # Physical realisticity barrier for float32 stability
+        new_s = jnp.where(jnp.isnan(new_s) | jnp.isinf(new_s), s, new_s)
+        return {"sAMPA": new_s}
     def compute_current(self, states, pre_v, post_v, params): return params["gAMPA"] * states["sAMPA"] * (post_v - params["EAMPA"])
 
 class GradedGABAa(jx.synapses.Synapse):
@@ -68,7 +73,9 @@ class GradedGABAa(jx.synapses.Synapse):
         s = states["sGABAa"]
         activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thGABAa"]) / params["slopeGABAa"]))
         d_s = (-s / params["tauDGABAa"]) + activation * ((1 - s) / params["tauRGABAa"])
-        return {"sGABAa": s + d_s * dt}
+        new_s = s + d_s * dt
+        new_s = jnp.where(jnp.isnan(new_s) | jnp.isinf(new_s), s, new_s)
+        return {"sGABAa": new_s}
     def compute_current(self, states, pre_v, post_v, params): return params["gGABAa"] * states["sGABAa"] * (post_v - params["EGABAa"])
 
 class GradedGABAb(jx.synapses.Synapse):
@@ -85,7 +92,9 @@ class GradedGABAb(jx.synapses.Synapse):
         s = states["sGABAb"]
         activation = 0.5 * (1 + jnp.tanh((pre_v - params["V_thGABAb"]) / params["slopeGABAb"]))
         d_s = (-s / params["tauDGABAb"]) + activation * ((1 - s) / params["tauRGABAb"])
-        return {"sGABAb": s + d_s * dt}
+        new_s = s + d_s * dt
+        new_s = jnp.where(jnp.isnan(new_s) | jnp.isinf(new_s), s, new_s)
+        return {"sGABAb": new_s}
     def compute_current(self, states, pre_v, post_v, params): 
         return params["gGABAb"] * states["sGABAb"] * (post_v - params["EGABAb"])
 
@@ -137,3 +146,59 @@ def build_net_eig(num_e: int, num_ig: int, num_il: int, seed: Optional[int] = No
     fully_connect(pre_il, post_il, GradedGABAa(g=5.0, tauD_GABAa=5.0)) # Increased to 5.0ms
 
     return net
+
+
+def build_pyramidal_mc(seed=None):
+    """Multi-compartment Pyramidal cell (Soma + Distal Dendrite)."""
+    if seed is None: seed = 42
+    comp_soma = jx.Compartment()
+    comp_dend = jx.Compartment()
+    # Simple cable: Soma (0) -> Dendrite (1)
+    cell = jx.Cell([comp_soma, comp_dend], parents=[-1, 0])
+    cell.radius = 1.0
+    cell.length = 100.0 # Length drives axial resistance
+    return cell
+
+
+# --- Cell Models (Pyramidal, PV, SST, VIP) ---
+
+def build_pyramidal_cell():
+    """Regular Spiking (RS) Pyramidal Cell with adaptation."""
+    comp_soma = jx.Compartment()
+    comp_dend = jx.Compartment()
+    cell = jx.Cell([comp_soma, comp_dend], parents=[-1, 0])
+    cell.radius = 1.0
+    cell.length = 100.0
+    # High adaptation, standard HH
+    cell.insert(jx.channels.HH())
+    # Assuming Jaxley HH has gK, gNa, gl. 
+    # For RS: gK is moderate, gNa is moderate.
+    return cell
+
+def build_pv_cell():
+    """Fast Spiking (FS) Parvalbumin Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 1.0
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    # FS typically has very high gNa and gK for fast repolarization
+    return cell
+
+def build_sst_cell():
+    """Low-Threshold Spiking (LTS) Somatostatin Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 1.0
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    return cell
+
+def build_vip_cell():
+    """Irregular Spiking / Bursting VIP Interneuron."""
+    comp_soma = jx.Compartment()
+    cell = jx.Cell([comp_soma], parents=[-1])
+    cell.radius = 0.5 # Smaller size, lower capacitance
+    cell.length = 10.0
+    cell.insert(jx.channels.HH())
+    return cell

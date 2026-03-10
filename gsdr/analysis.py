@@ -250,3 +250,8 @@ def plot_full_simulation_summary(recorded_voltages, time_axis, dt_global,
     plt.tight_layout()
     if save: plt.savefig(savename, format='svg')
     plt.show()
+
+
+def calculate_axial_current(traces_soma, traces_dend, ra=100.0):
+    """Calculates the axial current (MEG dipole approximation)."""
+    return (traces_dend - traces_soma) / ra

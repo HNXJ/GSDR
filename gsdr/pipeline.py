@@ -77,6 +77,58 @@ def get_loss_fn(net, transform, dt_global, global_psd_interval,
 
     return loss_fn
 
+def get_scz_loss_fn(net, target_psd, dt_global=0.1, ra=100.0):
+    """
+    Returns a loss function targeting MEG dipole spectra (Axial Current).
+    """
+    from .analysis import calculate_axial_current
+
+    def loss_fn(opt_params):
+        # 1. Simulate
+        # Note: ScZ model uses multi-compartment cells. 
+        # net.cell('all').branch(0) is Soma, branch(1) is Dendrite.
+        net.delete_stimuli()
+        net.delete_recordings()
+        
+        # Stimulate Soma of E-cells (indices 0 to 35)
+        ac_currents = noise_current_ac(
+            i_delay=500.0, i_dur=500.0, amp_n=0.0, amp_b=0.2,
+            spect=jnp.array([120.0]), delta_t=dt_global, t_max=1500.0
+        )
+        net.cell(range(36)).branch(0).loc(0.0).data_stimulate(ac_currents)
+        
+        # Record from Soma and Dendrite of E-cells
+        net.cell(range(36)).branch(0).loc(0.0).record()
+        net.cell(range(36)).branch(1).loc(1.0).record()
+        
+        traces = jx.integrate(net, params=opt_params, delta_t=dt_global, t_max=1500.0)
+        
+        # 2. Calculate Axial Current (Dipole)
+        # traces shape: (num_recordings, num_time_points)
+        # indices 0-35 are Soma, 36-71 are Dendrite
+        traces_soma = traces[:36, :]
+        traces_dend = traces[36:, :]
+        
+        i_axial = calculate_axial_current(traces_soma, traces_dend, ra=ra)
+        pop_dipole = jnp.mean(i_axial, axis=0) # Population average dipole
+        
+        # 3. PSD of Dipole
+        # FFT of the stimulus window (500-1000ms)
+        start_idx, end_idx = int(500/dt_global), int(1000/dt_global)
+        window_signal = pop_dipole[start_idx:end_idx]
+        
+        sim_psd = jnp.abs(jnp.fft.rfft(window_signal))**2
+        # Normalize
+        sim_psd = sim_psd / (jnp.max(sim_psd) + 1e-6)
+        
+        # Trim target_psd to match sim_psd shape if necessary
+        t_psd = target_psd[:sim_psd.shape[0]]
+        
+        loss = jnp.mean(jnp.square(sim_psd - t_psd))
+        return loss, traces
+
+    return loss_fn
+
 def train_net(net, optimizer, transform, dataloader, loss_fn, 
               ampa_pre_inds, ampa_post_inds, gaba_pre_inds, gaba_post_inds,
               dt_global, band_definitions, epoch_n=100, initial_params=None):
