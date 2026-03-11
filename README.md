@@ -15,8 +15,8 @@ The repository includes the `gsdr/` package for modular development:
 
 ## 🧬 Biological Data
 The model is validated against the `oxm0818` dataset. Raw unit data is required for PSD and Kappa validation plots.
-- **Path**: `drive/ReadOnly/`
-- **Files**:
+- **Public Data Link**: [Google Drive - oxm0818 Dataset](https://drive.google.com/drive/folders/1TwEl4AERajbhQe8-kFExx8EcCLMAZh2O?usp=sharing)
+- **Included Files**:
   - `oxm0818_units.npy`: Continuous traces for sorted units.
   - `oxm0818_units_info.npy`: Metadata for units.
 
