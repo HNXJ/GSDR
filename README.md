@@ -13,11 +13,10 @@ The repository includes the `gsdr/` package for modular development:
 - `gsdr.analysis`: Spectral and synchrony analysis tools.
 - `gsdr.data_loader`: Standardized loading of biological comparison data.
 
-## 🧬 Biological Data
-The model is validated against the `oxm0818` dataset. Raw unit data is required for PSD and Kappa validation plots.
+## 🧬 Neurophysiology Data
+The data used for electrophysiologic analysis parts :
 - **Public Data Link**: [Google Drive - oxm0818 Dataset](https://drive.google.com/drive/folders/1TwEl4AERajbhQe8-kFExx8EcCLMAZh2O?usp=sharing)
-- **Included Files**:
-  - `oxm0818_units.npy`: Continuous traces for sorted units.
+- **Included Files**: Sorted units based on Multi-area Dense Laminar Neurophysiology (MaDeLaNe)
+  - `oxm0818_units.npy`: Continuous traces for sorted units (from three 128-channel probes)
   - `oxm0818_units_info.npy`: Metadata for units.
-
-*Note: Data files are located in the synced Google Drive ReadOnly directory.*
+  - For more information regarding the experimental design and recording details, see the Methods section of manuscript
