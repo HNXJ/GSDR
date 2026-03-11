@@ -3,7 +3,7 @@
 Biophysical neural network modeling and optimization using JAX and Jaxley.
 
 ## 🚀 Core Notebooks
-- **[Biophys_SX.ipynb](./Biophys_SX.ipynb)**: Main simulation and optimization pipeline for 3-population (E, IG, IL) cortical networks.
+- **[Biophys_SX.ipynb](./Biophys_SX.ipynb)**: Main simulation and optimization pipeline for EI network example.
 - **[kappa_synch.ipynb](./kappa_synch.ipynb)**: Detailed analysis of population synchrony using Fleiss' Kappa.
 
 ## 📦 Modular Library
