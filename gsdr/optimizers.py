@@ -217,7 +217,7 @@ def GSDR(
 
     return optax.GradientTransformation(init_fn, update_fn)
 
-# --- AGSDR (Adaptive GSDR) ---
+# --- AGSDR (Adaptive GSDR) with Enhanced Exploration ---
 
 def AGSDR(
     inner_optimizer: optax.GradientTransformation,
@@ -230,12 +230,24 @@ def AGSDR(
     mcdp: bool = True,
     ema_momentum: float = 0.9,
     alpha_min: float = 0.1,
-    alpha_max: float = 0.9
+    alpha_max: float = 0.9,
+    exploration_phase_steps: int = 50,
+    exploration_amplitude: float = 2.0,
+    stuck_jolt_amplitude: float = 3.0
 ) -> optax.GradientTransformation:
     """
-    Adaptive GSDR (AGSDR) v2.
-    Alpha is determined by EMA-smoothed inverse ratio of update variances.
-    Includes an alpha floor to prevent stochastic deadlock.
+    Adaptive GSDR (AGSDR) v3 with Enhanced Exploration for Finding Active Modes.
+
+    Key improvements:
+    - Aggressive initial exploration phase (exploration_phase_steps with exploration_amplitude)
+    - Higher random walk amplitude to escape local minima / all-silent states
+    - Exploration jolt when stuck (stuck_jolt_amplitude for non-improving steps)
+    - Better handling of dead-end states where network doesn't spike
+
+    Args:
+        exploration_phase_steps: Number of steps to favor exploration at start (default 50)
+        exploration_amplitude: Multiplication factor for random walk during initial phase (default 2.0)
+        stuck_jolt_amplitude: Jolt amplitude when stuck (no improvement), to escape (default 3.0)
     """
     def init_fn(params):
         inner_state = inner_optimizer.init(params)
@@ -287,15 +299,30 @@ def AGSDR(
         def normal_branch(operand):
             _params, _new_params_opt, _new_inner_state_opt, _current_step = operand
             time_since_last_change = jnp.maximum(0, _current_step - step_of_last_optimal_change)
-            
-            # Verbose Warning for Stuck States
+
+            # Verbose Warning for Stuck States (Exploration Jolt Trigger)
             def stuck_warning(step):
-                jax.debug.print("⚠️ WARNING: Optimizer stuck for {s} epochs. Triggering exploration jolt.", s=step)
-            
-            jax.lax.cond((time_since_last_change % checkpoint_n == 0) & (time_since_last_change > 0), 
+                jax.debug.print("⚠️ EXPLORATION JOLT: Optimizer stuck for {s} epochs. Amplifying random walk.", s=step)
+
+            jax.lax.cond((time_since_last_change % checkpoint_n == 0) & (time_since_last_change > 0),
                          stuck_warning, lambda x: None, time_since_last_change)
 
+            # Enhanced exploration:
+            # 1. Aggressive initial exploration phase (first exploration_phase_steps)
+            # 2. Exploration jolt when stuck (stuck_jolt_amplitude)
+            in_exploration_phase = _current_step < exploration_phase_steps
+            exploration_jolt_active = (time_since_last_change > 0) & (time_since_last_change % checkpoint_n == 0)
+
+            # Base lambda_d growth
             effective_lambda_d = (time_since_last_change**2) * (1.0 - jnp.exp(-(time_since_last_change) / tau_a_growth))
+
+            # During initial exploration: favor exploration 2x over supervised
+            exploration_boost = jnp.where(in_exploration_phase, exploration_amplitude, 1.0)
+
+            # When stuck: apply jolt amplitude to escape local minima / dead modes
+            stuck_jolt = jnp.where(exploration_jolt_active, stuck_jolt_amplitude, 1.0)
+
+            effective_lambda_d = effective_lambda_d * exploration_boost * stuck_jolt
 
             inner_opt_key, noise_key = jax.random.split(key, 2)
             inner_updates, updated_inner_state = inner_optimizer.update(grads, state.inner_state, _params, key=inner_opt_key)
@@ -314,26 +341,29 @@ def AGSDR(
             flat_delta = jnp.concatenate([jnp.ravel(x) for x in jax.tree.leaves(delta)])
             curr_var_sup = jnp.var(flat_inner)
             curr_var_unsup = jnp.var(flat_delta)
-            
+
             new_var_sup_ema = ema_momentum * state.var_sup_ema + (1 - ema_momentum) * curr_var_sup
             new_var_unsup_ema = ema_momentum * state.var_unsup_ema + (1 - ema_momentum) * curr_var_unsup
-            
+
             epsilon = 1e-8
             denom = new_var_sup_ema + new_var_unsup_ema + epsilon
             # If denom is very small, we are likely stuck -> favor exploration
             next_a = jnp.where(denom > 1e-6, new_var_sup_ema / denom, 0.8)
-            
+
+            # During initial exploration: bias toward exploration (lower a = more exploration)
+            exploration_a_bias = jnp.where(in_exploration_phase, 0.7, alpha_min)
+
             # Enforce Stochastic Floor
-            next_a = jnp.clip(next_a, alpha_min, alpha_max)
-            
+            next_a = jnp.clip(next_a, exploration_a_bias, alpha_max)
+
             # Alpha Floor Warning
-            jax.lax.cond(next_a <= alpha_min, 
-                         lambda: jax.debug.print("⚠️ WARNING: AGSDR Alpha locked at floor ({f}). Supervised variance is too low.", f=alpha_min), 
+            jax.lax.cond(next_a <= alpha_min,
+                         lambda: jax.debug.print("⚠️ WARNING: AGSDR Alpha locked at floor ({f}). Supervised variance is too low.", f=alpha_min),
                          lambda: None)
-            
+
             # Dampening barrier
             next_a = jnp.where(jnp.isnan(next_a) | jnp.isinf(next_a), state.a, next_a)
-            
+
             combined_updates = jax.tree.map(lambda d, g: effective_lambda_d * (next_a * d + (1.0 - next_a) * g), delta, inner_updates)
 
             return combined_updates, GSDRState(
@@ -350,3 +380,46 @@ def AGSDR(
         return jax.lax.cond(should_reset, reset_branch, normal_branch, (params, new_params_opt, new_inner_state_opt, current_step))
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+# --- Convenience: AGSDR for Spiking Networks ---
+
+def AGSDR_for_spiking_networks(
+    learning_rate: float = 5e-3,
+    exploration_phase_steps: int = 100,
+    exploration_amplitude: float = 2.5,
+    stuck_jolt_amplitude: float = 4.0,
+    checkpoint_n: int = 8
+) -> optax.GradientTransformation:
+    """
+    Convenience wrapper: AGSDR optimized for finding active spiking modes.
+
+    Useful for networks that might be in all-silent states or low-activity regimes.
+    Uses aggressive initial exploration and higher jolt amplitudes to escape
+    local minima and discover spiking activity.
+
+    Args:
+        learning_rate: Base learning rate for inner optimizer
+        exploration_phase_steps: Steps to favor exploration at start (default 100)
+        exploration_amplitude: Exploration boost during initial phase (default 2.5)
+        stuck_jolt_amplitude: Amplitude boost when stuck, to escape (default 4.0)
+        checkpoint_n: Steps before triggering exploration jolt (default 8)
+
+    Returns:
+        optax.GradientTransformation for use with GSDR/AGSDR optimization loop
+    """
+    inner_opt = optax.adam(learning_rate=learning_rate)
+
+    return AGSDR(
+        inner_optimizer=inner_opt,
+        a_init=0.5,
+        lambda_d=1.0,
+        checkpoint_n=checkpoint_n,
+        tau_a_growth=10.0,
+        exploration_phase_steps=exploration_phase_steps,
+        exploration_amplitude=exploration_amplitude,
+        stuck_jolt_amplitude=stuck_jolt_amplitude,
+        ema_momentum=0.9,
+        alpha_min=0.05,  # More aggressive exploration minimum
+        alpha_max=0.95
+    )
